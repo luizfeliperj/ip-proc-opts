@@ -1,0 +1,307 @@
+#ifdef HAVE_CONFIG_H
+# include "config.h"
+#endif
+
+#include <stdio.h>
+#include <string.h>
+#include <glib.h>
+#include <epan/in_cksum.h>
+
+#include <epan/packet.h>
+#include <epan/prefs.h>
+#include <epan/ip_opts.h>
+#include <epan/ipproto.h>
+
+#define TCPH_MIN_LEN            20 /*Minimun length of TCP header*/
+
+static int proto_tcp_orb = -1;
+
+static int hf_tcp_option_orb_meta_opt = -1;
+static int hf_tcp_option_orb_async_info = -1;
+
+static gint ett_tcp_option_orb_meta_opt = -1;
+static gint ett_tcp_option_orb_async_info = -1;
+
+/* */
+#define TCPOPT_EOL                0
+#define TCPOPT_ORB_META_OPT       24 
+#define TCPOPT_ORB_ASYNC_INFO     25
+
+/*
+ *     TCP option lengths
+ */
+#define TCPOLEN_ORB_META_OPT_MIN   2
+#define TCPOLEN_ORB_ASYNC_INFO     5
+
+static void dissect_tcpopt_orb_meta_opt(const ip_tcp_opt *optp, tvbuff_t *tvb,
+    int offset, guint optlen, packet_info *pinfo, proto_tree *opt_tree)
+{
+    proto_tree *field_tree;
+	proto_item *pitem;
+	guint8 orb_meta_len;
+	guint8 remaining_len;
+
+	/*Delete or hide the existing text node for orbital meta options*/
+	field_tree = opt_tree->first_child;
+	while(field_tree!=NULL){
+		if(field_tree->finfo!=NULL){
+			if(TCPOPT_ORB_META_OPT == tvb_get_guint8(tvb, field_tree->finfo->start)){
+				PROTO_ITEM_SET_HIDDEN((proto_item *) field_tree);
+				break;
+			}
+		}
+		else{
+			field_tree = field_tree->next;
+		}
+	}
+
+	orb_meta_len = tvb_get_guint8(tvb, offset+1);
+	remaining_len = orb_meta_len;
+	pitem = proto_tree_add_boolean_format_value(
+        opt_tree, hf_tcp_option_orb_meta_opt, tvb, offset, optlen, 1,
+        "%u bytes", orb_meta_len);
+	field_tree = proto_item_add_subtree(pitem, ett_tcp_option_orb_meta_opt);
+}
+
+struct orbital_async_info{
+	guint8 type;
+	guint8 length;
+};
+
+static void dissect_tcpopt_orb_async_info(const ip_tcp_opt *optp, tvbuff_t *tvb,
+    int offset, guint optlen, packet_info *pinfo, proto_tree *opt_tree)
+{
+	proto_tree *field_tree;
+	proto_item *pitem;
+	struct orbital_async_info orb_async_info;
+	
+	/*Delete or hide the existing text node for orbital asynchronous info*/
+	field_tree = opt_tree->first_child;
+	while(field_tree!=NULL){
+		if(field_tree->finfo!=NULL){
+			if(TCPOPT_ORB_ASYNC_INFO == tvb_get_guint8(tvb, field_tree->finfo->start)){
+				PROTO_ITEM_SET_HIDDEN((proto_item *) field_tree);
+				break;
+			}
+		}
+		else{
+			field_tree = field_tree->next;
+		}
+	}
+
+	orb_async_info.type=tvb_get_guint8(tvb, offset);
+	orb_async_info.length= tvb_get_guint8(tvb, offset+1);
+	pitem = proto_tree_add_boolean_format_value(
+        opt_tree, hf_tcp_option_orb_async_info, tvb, offset, optlen, 1,
+		"%u bytes", orb_async_info.length);
+	field_tree = proto_item_add_subtree(pitem, ett_tcp_option_orb_async_info);
+}
+
+static const ip_tcp_opt tcpopts_orb[] = {
+  {
+        TCPOPT_ORB_META_OPT,
+        "Orbital Meta Option",
+        NULL,
+        OPT_LEN_VARIABLE_LENGTH,
+        TCPOLEN_ORB_META_OPT_MIN,
+        dissect_tcpopt_orb_meta_opt
+  },
+  {
+        TCPOPT_ORB_ASYNC_INFO,
+        "Orbital Asynchronous Information",
+        NULL,
+        OPT_LEN_FIXED_LENGTH,
+        TCPOLEN_ORB_ASYNC_INFO,
+        dissect_tcpopt_orb_async_info
+  }
+};
+
+#define N_TCP_OPTS_ORB  array_length(tcpopts_orb)
+
+
+/*
+ *This function is identical to the functon dissect_ip_tcporb_options() found in /epan/dissectors/packet-ip.c. 
+ *I have included it here after certain trivial modifications. Note to self: The current function is inefficieant, modify later.
+ */
+void
+dissect_ip_tcporb_options(tvbuff_t *tvb, int offset, guint length,
+                       const ip_tcp_opt *opttab, int nopts, int eol,
+                        packet_info *pinfo, proto_tree *opt_tree,
+                        proto_item *opt_item)
+{
+  guchar            opt;
+  const ip_tcp_opt *optp;
+  opt_len_type      len_type;
+  unsigned int      optlen;
+  const char       *name;
+  void            (*dissect)(const struct ip_tcp_opt *, tvbuff_t *,
+                             int, guint, packet_info *, proto_tree *);
+  guint             len, nop_count = 0;
+
+  while (length > 0) {
+    opt = tvb_get_guint8(tvb, offset);
+    for (optp = &opttab[0]; optp < &opttab[nopts]; optp++) {
+      if (optp->optcode == opt)
+        break;
+    }
+    if (optp == &opttab[nopts]) {
+      /* We assume that the only OPT_LEN_NO_LENGTH options are EOL and NOP options,
+         so that we can treat unknown options as OPT_LEN_VARIABLE_LENGTH with a
+         minimum of 2, and at least be able to move on to the next option
+         by using the length in the option. */
+      optp = NULL;  /* indicate that we don't know this option */
+      len_type = OPT_LEN_VARIABLE_LENGTH;
+      optlen = 2;
+      name = ep_strdup_printf("");
+      dissect = NULL;
+      nop_count = 0;
+    } else {
+      len_type = optp->len_type;
+      optlen = optp->optlen;
+      name = optp->name;
+      dissect = optp->dissect;
+      if (opt_item && len_type == OPT_LEN_NO_LENGTH && optlen == 0 && opt == 1 &&
+         (nop_count == 0 || offset % 4)) { /* opt 1 = NOP in both IP and TCP */
+        /* Count number of NOP in a row within a uint32 */
+        nop_count++;
+      } else {
+        nop_count = 0;
+      }
+    }
+    --length;      /* account for type byte */
+    if (len_type != OPT_LEN_NO_LENGTH) {
+      /* Option has a length. Is it in the packet? */
+      if (length == 0) {
+        /* Bogus - packet must at least include option code byte and
+           length byte! */
+        return;
+      }
+      len = tvb_get_guint8(tvb, offset + 1);  /* total including type, len */
+      --length;    /* account for length byte */
+      if (len < 2) {
+        /* Bogus - option length is too short to include option code and
+           option length. */
+        return;
+      } else if (len - 2 > length) {
+        /* Bogus - option goes past the end of the header. */
+        return;
+      } else if (len_type == OPT_LEN_FIXED_LENGTH && len != optlen) {
+        /* Bogus - option length isn't what it's supposed to be for this
+           option. */
+        return;
+      } else if (len_type == OPT_LEN_VARIABLE_LENGTH && len < optlen) {
+        /* Bogus - option length is less than what it's supposed to be for
+           this option. */
+        return;
+      } else {
+        if (optp == NULL) {
+          /*Do nothing. This is not an option we're trying to dissect*/
+        } else {
+          if (dissect != NULL) {
+            /* Option has a dissector. */
+            proto_item_append_text(proto_tree_get_parent(opt_tree), ", %s",
+                                   optp->name);
+            (*dissect)(optp, tvb, offset, len, pinfo, opt_tree);
+          } else {
+            /* Option has no data, hence no dissector. */
+          }
+        }
+        len -= 2;   /* subtract size of type and length */
+        offset += 2 + len;
+      }
+      length -= len;
+    } else {
+      if (dissect != NULL) {
+        proto_item_append_text(proto_tree_get_parent(opt_tree), ", %s",
+                               optp->name);
+        (*dissect)(optp, tvb, offset, 1, pinfo, opt_tree);
+      } else {
+        /* Option has no data, hence no dissector. */
+      }
+      offset += 1;
+    }
+    if (opt == eol) break;
+  }
+}
+
+
+static void
+dissect_tcp_orb(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree)
+{
+	int         offset = 0;
+	guint       optlen;
+	guint8      th_off_x2;
+	guint8      tcp_hlen;  /*Lenth of the tcp header*/
+	proto_tree  *tcp_tree=NULL;
+	proto_tree  *opt_tree=NULL;
+	proto_item  *opt_item=NULL;
+	field_info  *tcp_fi;
+
+	if(tree){
+		/*Do nothing (for now).*/
+	}
+	tcp_tree=(proto_tree *)pinfo->tcp_tree;
+	if(tcp_tree){
+		tcp_fi=tcp_tree->finfo;
+		offset=tcp_fi->start;
+		th_off_x2 = tvb_get_guint8(tvb, offset + 12);
+	    tcp_hlen = hi_nibble(th_off_x2) * 4;
+	    if (tcp_hlen > TCPH_MIN_LEN) {
+			optlen = tcp_hlen - TCPH_MIN_LEN;
+			tvb_ensure_bytes_exist(tvb, offset +  20, optlen);
+			/*
+			  Traverse to opt_tree node(the node corresponding to the options field in TCP)
+			 */
+			opt_tree=tcp_tree->first_child;
+			while(opt_tree!=NULL){
+				if(opt_tree->finfo->start == (offset+20)){ 
+					opt_item=(proto_item *)opt_tree;
+					dissect_ip_tcporb_options(tvb, offset + 20, optlen,
+                             tcpopts_orb, N_TCP_OPTS_ORB, TCPOPT_EOL, pinfo, opt_tree, opt_item);
+					break;
+				}
+				else{
+					opt_tree=opt_tree->next;
+				}
+			}			
+		}
+	}
+}
+
+void 
+proto_register_tcp_orb(void)
+{
+	static hf_register_info hf[] = {
+		{ &hf_tcp_option_orb_meta_opt,
+          { "Orbital Meta Options", "tcp.options.orb_meta_opt",
+            FT_BOOLEAN, BASE_NONE, NULL, 0x0,
+            "TCP Orbital Meta Option", HFILL }},
+		{ &hf_tcp_option_orb_async_info,
+          { "Orbital Asynchronous Information", "tcp.options.orb_async_info",
+            FT_BOOLEAN, BASE_NONE, NULL, 0x0,
+            "TCP Orbital Asynchronous Information", HFILL }}
+	};
+
+	static gint *ett[] = {
+		&ett_tcp_option_orb_meta_opt,
+		&ett_tcp_option_orb_async_info
+	};
+
+	/* Register the protocol name and description */
+	proto_tcp_orb = proto_register_protocol("Transmission Control Protocol Orbital Options",
+        "TCPORB", "tcporb");
+	register_dissector("tcporb", dissect_tcp_orb, proto_tcp_orb);
+		
+	/* Required function calls to register the header fields and subtree used */
+	proto_register_field_array(proto_tcp_orb, hf, array_length(hf));
+    proto_register_subtree_array(ett, array_length(ett));
+}
+
+void
+proto_reg_handoff_tcp_orb(void)
+{
+    dissector_handle_t tcp_orb_handle;
+
+    tcp_orb_handle = find_dissector("tcporb");
+	register_postdissector(tcp_orb_handle);
+}
